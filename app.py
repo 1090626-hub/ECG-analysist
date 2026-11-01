@@ -2,13 +2,14 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from scipy.signal import find_peaks, butter, filtfilt
 
 # 웹페이지 기본 설정
 st.set_page_config(page_title="실시간 ECG 및 R-R 간격 분석기", layout="wide")
 
 st.title("🫀 웨어러블 ECG 노이즈 강건성 및 R-R 간격 분석 웹앱")
-st.markdown("날것의 심전도(ECG) 데이터에 잔여 노이즈를 주입하고, 대역통과 필터 전후의 **파형, R-R 간격 타코그램, 그리고 지표별 오차율 비교**를 구역별로 나누어 정밀 분석합니다.")
+st.markdown("날것의 심전도(ECG) 데이터에 잔여 노이즈를 주입하고, 대역통과 필터 전후의 **파형, 인터랙티브 R-R 간격 타코그램, 지표별 오차율 비교**를 구역별로 나누어 정밀 분석합니다.")
 
 # 사이드바 설정 (분석 파라미터 조절)
 st.sidebar.header("⚙️ 분석 파라미터 및 노이즈 설정")
@@ -64,7 +65,7 @@ if clean_signal is not None:
     peaks_clean, props_clean = find_peaks(clean_signal, height=peak_height, distance=int(fs * 0.4), prominence=0.2)
     peaks_noisy, props_noisy = find_peaks(filtered_signal, height=peak_height, distance=int(fs * 0.4), prominence=0.2)
 
-    # 기본 R-R 간격 및 심박수 계산 (필터링된 노이즈 신호 기준)
+    # 기본 R-R 간격 및 심박수 계산
     if len(peaks_noisy) > 1:
         rr_intervals_ms = np.diff(peaks_noisy) / fs * 1000
         mean_rr = np.mean(rr_intervals_ms)
@@ -115,19 +116,37 @@ if clean_signal is not None:
     st.pyplot(fig1)
 
     # ==========================================
-    # [구역 2] R-R 간격 타코그램 (원래 기능)
+    # [구역 2] R-R 간격 타코그램 (Plotly 인터랙티브)
     # ==========================================
     st.markdown("---")
-    st.header("📈 [구역 2] R-R 간격 타코그램 (심장박동 주기 시각화)")
-    st.markdown("연속된 R-Peak 사이의 시간 간격을 추적하여 심장박동 주기의 미세한 변동(HRV)을 실시간으로 시각화합니다.")
+    st.header("📈 [구역 2] R-R 간격 타코그램 (인터랙티브 심장박동 주기 시각화)")
+    st.markdown("마우스를 그래프의 선이나 점 위에 올리면(Hover) 해당 박동의 **Beat Index와 정확한 R-R 간격(ms)** 수치가 실시간으로 팝업됩니다.")
 
     if len(peaks_noisy) > 1:
-        fig2, ax2 = plt.subplots(figsize=(12, 3.5), dpi=300)
-        ax2.plot(range(1, len(rr_intervals_ms)+1), rr_intervals_ms, marker='o', color='#2ca02c', linestyle='-', linewidth=1.5, markersize=5)
-        ax2.set_xlabel("Beat Index", fontweight='bold')
-        ax2.set_ylabel("R-R Interval (ms)", fontweight='bold')
-        ax2.grid(True, linestyle='--', alpha=0.5)
-        st.pyplot(fig2)
+        beat_indices = list(range(1, len(rr_intervals_ms) + 1))
+        
+        # Plotly를 이용한 인터랙티브 선 그래프 생성
+        fig_interactive = go.Figure()
+        fig_interactive.add_trace(go.Scatter(
+            x=beat_indices,
+            y=rr_intervals_ms,
+            mode='lines+markers',
+            name='R-R Interval',
+            line=dict(color='#2ca02c', width=2),
+            marker=dict(size=8, color='#2ca02c'),
+            hovertemplate='<b>Beat Index</b>: %{x}<br><b>R-R Interval</b>: %{y:.1f} ms<extra></extra>'
+        ))
+        
+        fig_interactive.update_layout(
+            xaxis_title="Beat Index",
+            yaxis_title="R-R Interval (ms)",
+            hovermode="closest",
+            margin=dict(l=40, r=40, t=20, b=40),
+            height=350,
+            plot_bgcolor='rgba(240,242,246,0.5)',
+            paper_bgcolor='rgba(0,0,0,0)'
+        )
+        st.plotly_chart(fig_interactive, use_container_width=True)
     else:
         st.warning("R-Peak가 2개 이상 감지되지 않아 타코그램을 그릴 수 없습니다. 임계값을 조절해 보세요.")
 
