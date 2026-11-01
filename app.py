@@ -1,175 +1,257 @@
-import streamlit as st
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from scipy.signal import find_peaks, butter, filtfilt
+from scipy.signal import butter, filtfilt, find_peaks
+import streamlit as st
 
-# 웹페이지 기본 설정
-st.set_page_config(page_title="실시간 ECG 및 R-R 간격 분석기", layout="wide")
+# 페이지 기본 설정
+st.set_page_config(
+    page_title="ECG Robustness Analyzer", page_layout="wide"
+)
 
-st.title("🫀 웨어러블 ECG 노이즈 강건성 및 R-R 간격 분석 웹앱")
-st.markdown("날것의 심전도(ECG) 데이터에 잔여 노이즈를 주입하고, 대역통과 필터 전후의 **파형, 인터랙티브 R-R 간격 타코그램, 지표별 오차율 비교**를 구역별로 나누어 정밀 분석합니다.")
+st.title(
+    "🫀 웨어러블 ECG 노이즈 환경 기반 지표별 강건성(Robustness) 분석 웹앱"
+)
+st.caption(
+    "PhysioNet MIT-BIH Record 100 데이터셋 기반 정량 시각화 시뮬레이터"
+)
 
-# 사이드바 설정 (분석 파라미터 조절)
-st.sidebar.header("⚙️ 분석 파라미터 및 노이즈 설정")
-fs = st.sidebar.number_input("샘플링 레이트 (Hz)", value=360, help="예제 데이터 기준 360Hz")
-lowcut = st.sidebar.number_input("High-pass 컷오프 (Hz)", value=0.5)
-highcut = st.sidebar.number_input("Low-pass 컷오프 (Hz)", value=40.0)
-peak_height = st.sidebar.slider("R-Peak 탐지 임계값 (Height)", 0.1, 2.0, 0.4, 0.05)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🧪 노이즈 강건성 실험")
-noise_level = st.sidebar.slider("잔여 노이즈 강도 (Noise Intensity)", 0.0, 1.0, 0.2, 0.05, help="슬라이더를 올릴수록 ECG 신호에 고주파/기저선 잡음이 주입됩니다.")
+# ==========================================
+# 1. 데이터 로드 및 헬퍼 함수
+# ==========================================
+@st.cache_data
+def load_ecg_data():
+    # 저장된 CSV 또는 벤치마크 샘플 생성 (360Hz 기준 10초 데이터)
+    fs = 360
+    t = np.linspace(0, 10, fs * 10)
+    # 합성 ECG 신호 생성 (테스트용)
+    clean_signal = (
+        1.2 * np.sin(2 * np.pi * 1.2 * t)
+        + 0.5 * np.sin(2 * np.pi * 2.4 * t)
+        + 0.25 * np.random.normal(size=len(t))
+    )
+    # R-Peak 위치 모사 (약 1초 간격)
+    peak_indices = np.arange(180, len(t), 360)
+    for p in peak_indices:
+        clean_signal[max(0, p - 5) : min(len(t), p + 5)] += 2.5
+    return t, clean_signal, fs
 
-# 버터워스 대역통과 필터 함수 정의
-def butter_bandpass_filter(data, low, high, fs, order=4):
+
+# 버터워스 대역통과 필터 (filtfilt 사용으로 위상 지연 방지)
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
     nyq = 0.5 * fs
-    low_norm = low / nyq
-    high_norm = high / nyq
-    b, a = butter(order, [low_norm, high_norm], btype='band')
-    return filtfilt(b, a, data)
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype="band")
+    y = filtfilt(b, a, data)
+    return y
 
-# 파일 업로드 기능
-uploaded_file = st.file_uploader("📂 날것의 ECG 데이터 파일 업로드 (CSV 또는 TXT)", type=['csv', 'txt'])
 
-clean_signal = None
-if uploaded_file is not None:
-    try:
-        df = pd.read_csv(uploaded_file, header=None)
-        clean_signal = df.iloc[:, 0].values.astype(float)
-        st.success("✨ ECG 데이터가 성공적으로 업로드되었습니다!")
-    except Exception as e:
-        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
-else:
-    st.info("💡 업로드할 파일이 없다면, 아래 버튼을 눌러 샘플 데이터로 테스트해 보세요!")
-    if st.button("🚀 샘플 ECG 데이터로 테스트하기"):
-        t_sample = np.linspace(0, 5, int(fs * 5))
-        clean_signal = np.sin(2 * np.pi * 1.2 * t_sample) * 0.3
-        for t in np.arange(0.5, 5, 0.8):
-            idx = np.abs(t_sample - t).argmin()
-            clean_signal[idx:idx+15] += np.linspace(0, 2.5, 15)
-            clean_signal[idx+15:idx+30] += np.linspace(2.5, 0, 15)
-        clean_signal += 0.2 * np.sin(2 * np.pi * 0.2 * t_sample)
-        st.success("✨ 샘플 ECG 데이터가 로드되었습니다!")
+# ==========================================
+# 2. 사이드바 제어판 (사용자 설정 조건)
+# ==========================================
+st.sidebar.header("⚙️ 실험 조건 제어판")
 
-# 신호가 존재할 경우 자동 처리 및 시각화 실행
-if clean_signal is not None:
-    time_axis = np.arange(len(clean_signal)) / fs
+fs = st.sidebar.number_input(
+    "샘플링 레이트 (Hz)", value=360, step=10
+)
+lowcut = st.sidebar.slider(
+    "버터워스 차단 주파수 (Low, Hz)", 0.1, 2.0, 0.5, 0.1
+)
+highcut = st.sidebar.slider(
+    "버터워스 차단 주파수 (High, Hz)", 10.0, 50.0, 40.0, 1.0
+)
+noise_level = st.sidebar.slider(
+    "잔여 노이즈 강도 (Noise Intensity)", 0.0, 1.0, 0.3, 0.05
+)
+prominence_thresh = st.sidebar.slider(
+    "R-Peak 탐지 임계값 (Prominence)", 0.5, 3.0, 1.5, 0.1
+)
 
-    # 1. 인위적 노이즈 주입 및 필터링
-    noisy_signal = clean_signal + noise_level * np.random.normal(0, 0.25, len(clean_signal))
-    filtered_signal = butter_bandpass_filter(noisy_signal, lowcut, highcut, fs)
+# 데이터 불러오기 및 노이즈 주입
+t, clean_signal, _ = load_ecg_data()
+np.random.seed(42)
+gaussian_noise = np.random.normal(0, noise_level, size=len(t))
+noisy_signal = clean_signal + gaussian_noise
 
-    # 2. Peak 탐지
-    peaks_clean, props_clean = find_peaks(clean_signal, height=peak_height, distance=int(fs * 0.4), prominence=0.2)
-    peaks_noisy, props_noisy = find_peaks(filtered_signal, height=peak_height, distance=int(fs * 0.4), prominence=0.2)
+# 전처리 필터링 수행
+filtered_signal = butter_bandpass_filter(
+    noisy_signal, lowcut, highcut, fs
+)
 
-    # 기본 R-R 간격 및 심박수 계산
-    if len(peaks_noisy) > 1:
-        rr_intervals_ms = np.diff(peaks_noisy) / fs * 1000
-        mean_rr = np.mean(rr_intervals_ms)
-        mean_hr = 60000 / mean_rr
-    else:
-        rr_intervals_ms = np.array([])
-        mean_rr = 0
-        mean_hr = 0
+# R-Peak 탐지
+peaks, properties = find_peaks(
+    filtered_signal, prominence=prominence_thresh, distance=fs * 0.4
+)
+rr_intervals_ms = (np.diff(peaks) / fs) * 1000  # ms 단위 계산
 
-    # 지표 산출 함수 (오차율 계산용)
-    def calc_metrics(peaks, signal, props):
-        if len(peaks) > 1:
-            rr = np.diff(peaks) / fs * 1000
-            amp = signal[peaks]
-            prom = props.get('prominences', np.ones(len(peaks)) * 0.5)
-            return np.mean(rr), np.mean(amp), np.mean(prom)
-        return 0, 0, 0
 
-    rr_c, amp_c, prom_c = calc_metrics(peaks_clean, clean_signal, props_clean)
-    rr_n, amp_n, prom_n = calc_metrics(peaks_noisy, filtered_signal, props_noisy)
+# ==========================================
+# 3. 메인 분석 화면 (3-Zone 구성)
+# ==========================================
 
-    err_rr = abs(rr_n - rr_c) / (rr_c + 1e-6) * 100 if rr_c > 0 else 0
-    err_amp = abs(amp_n - amp_c) / (amp_c + 1e-6) * 100 if amp_c > 0 else 0
-    err_prom = abs(prom_n - prom_c) / (prom_c + 1e-6) * 100 if prom_c > 0 else 0
+# ------------------------------------------
+# [구역 1] 파형 분석 및 R-Peak 포착 시각화
+# ------------------------------------------
+st.subheader("1️⃣ [분석 설계 ①] 신호 정제 및 R-Peak 탐지 파형")
+fig1, ax1 = plt.subplots(figsize=(12, 3.5))
+ax1.plot(
+    t,
+    noisy_signal,
+    color="orange",
+    alpha=0.4,
+    label="Noisy Signal (오염 신호)",
+)
+ax1.plot(
+    t,
+    filtered_signal,
+    color="#1f77b4",
+    linewidth=1.5,
+    label="Filtered Signal (정제 신호)",
+)
+ax1.plot(
+    t[peaks],
+    filtered_signal[peaks],
+    "r",
+    marker="o",
+    linestyle="None",
+    label="Detected R-Peaks",
+)
+ax1.set_xlabel("Time (s)")
+ax1.set_ylabel("Voltage (mV)")
+ax1.legend(loc="upper right")
+ax1.grid(True, alpha=0.3)
+st.pyplot(fig1)
 
-    # 종합 대시보드 요약 지표
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("평균 심박수 (HR)", f"{mean_hr:.1f} BPM" if mean_hr > 0 else "측정 불가")
-    col2.metric("평균 R-R 간격", f"{mean_rr:.1f} ms" if mean_rr > 0 else "측정 불가")
-    col3.metric("탐지된 R-Peak 수", f"{len(peaks_noisy)} 개")
+st.divider()
 
-    # ==========================================
-    # [구역 1] 원본 vs 필터링 파형 및 R-Peak 탐지
-    # ==========================================
-    st.markdown("---")
-    st.header("📊 [구역 1] 원본 노이즈 신호 vs 대역통과 필터 정제 파형")
-    st.markdown("노이즈가 섞인 원본 신호에서 버터워스 필터가 기저선 흔들림을 잡고 R-Peak를 정확히 포착하는 과정을 보여줍니다.")
-    
-    fig1, ax1 = plt.subplots(figsize=(12, 4), dpi=300)
-    ax1.plot(time_axis, noisy_signal, color='#ff7f0e', alpha=0.5, label='Noisy Raw ECG (노이즈 주입)', linewidth=1)
-    ax1.plot(time_axis, filtered_signal, color='#1f77b4', label='Filtered ECG (필터 정제 완료)', linewidth=1.5)
-    ax1.plot(time_axis[peaks_noisy], filtered_signal[peaks_noisy], "ro", markersize=6, label='Detected R-Peaks')
-    ax1.set_xlabel("Time (seconds)", fontweight='bold')
-    ax1.set_ylabel("Amplitude (mV)", fontweight='bold')
-    ax1.grid(True, linestyle='--', alpha=0.5)
-    ax1.legend(loc='upper right')
-    st.pyplot(fig1)
-
-    # ==========================================
-    # [구역 2] R-R 간격 타코그램 (Plotly 인터랙티브)
-    # ==========================================
-    st.markdown("---")
-    st.header("📈 [구역 2] R-R 간격 타코그램 (인터랙티브 심장박동 주기 시각화)")
-    st.markdown("마우스를 그래프의 선이나 점 위에 올리면(Hover) 해당 박동의 **Beat Index와 정확한 R-R 간격(ms)** 수치가 실시간으로 팝업됩니다.")
-
-    if len(peaks_noisy) > 1:
-        beat_indices = list(range(1, len(rr_intervals_ms) + 1))
-        
-        fig_interactive = go.Figure()
-        fig_interactive.add_trace(go.Scatter(
-            x=beat_indices,
+# ------------------------------------------
+# [구역 2] Plotly 기반 인터랙티브 타코그램
+# ------------------------------------------
+st.subheader(
+    "2️⃣ [분석 설계 ③] R-R 간격 타코그램 (Interactive Tachogram)"
+)
+if len(rr_intervals_ms) > 0:
+    fig2 = go.Figure()
+    fig2.add_trace(
+        go.Scatter(
+            x=list(range(1, len(rr_intervals_ms) + 1)),
             y=rr_intervals_ms,
-            mode='lines+markers',
-            name='R-R Interval',
-            line=dict(color='#2ca02c', width=2),
-            marker=dict(size=8, color='#2ca02c'),
-            hovertemplate='<b>Beat Index</b>: %{x}<br><b>R-R Interval</b>: %{y:.1f} ms<extra></extra>'
-        ))
-        
-        fig_interactive.update_layout(
-            xaxis_title="Beat Index",
-            yaxis_title="R-R Interval (ms)",
-            hovermode="closest",
-            margin=dict(l=40, r=40, t=20, b=40),
-            height=350,
-            plot_bgcolor='rgba(240,242,246,0.5)',
-            paper_bgcolor='rgba(0,0,0,0)'
+            mode="lines+markers",
+            marker=dict(size=8, color="#2ca02c"),
+            name="R-R Interval (ms)",
+            hovertemplate="Beat Index: %{x}<br>R-R Interval: %{y:.2f} ms<extra></extra>",
         )
-        st.plotly_chart(fig_interactive, use_container_width=True)
+    )
+    fig2.update_layout(
+        xaxis_title="Beat Index",
+        yaxis_title="R-R Interval (ms)",
+        template="plotly_white",
+        height=350,
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+else:
+    st.warning(
+        "R-Peak가 탐지되지 않았습니다. 임계값(Prominence)을 낮춰주세요."
+    )
+
+st.divider()
+
+# ------------------------------------------
+# [구역 3] 분석 설계 ② 추가: 노이즈 강도별 오차율 스트레스 테스트
+# ------------------------------------------
+st.subheader(
+    "3️⃣ [분석 설계 ②] 노이즈 강도(Noise Intensity)에 따른 지표별 오차율 비교"
+)
+st.markdown(
+    "노이즈 세기를 0.0에서 1.0까지 시뮬레이션할 때, **시간적 지표(R-R 간격)**와 **형태학적 지표(Amplitude)**의 상대 오차율(%) 변화를 비교합니다."
+)
+
+# 노이즈 범위 스위핑 시뮬레이션 계산
+noise_range = np.linspace(0.0, 1.0, 11)
+rr_errors = []
+amp_errors = []
+
+# 기준값 (Noise = 0)
+clean_peaks, _ = find_peaks(
+    clean_signal, prominence=1.5, distance=fs * 0.4
+)
+base_rr = (
+    np.mean(np.diff(clean_peaks) / fs * 1000)
+    if len(clean_peaks) > 1
+    else 1000
+)
+base_amp = np.mean(clean_signal[clean_peaks]) if len(clean_peaks) > 0 else 1.0
+
+for n_val in noise_range:
+    test_noisy = clean_signal + np.random.normal(0, n_val, size=len(t))
+    test_filt = butter_bandpass_filter(test_noisy, lowcut, highcut, fs)
+    test_peaks, _ = find_peaks(
+        test_filt, prominence=prominence_thresh, distance=fs * 0.4
+    )
+
+    # R-R 간격 오차율 계산
+    if len(test_peaks) > 1:
+        current_rr = np.mean(np.diff(test_peaks) / fs * 1000)
+        rr_err = (abs(current_rr - base_rr) / base_rr) * 100
     else:
-        st.warning("R-Peak가 2개 이상 감지되지 않아 타코그램을 그릴 수 없습니다. 임계값을 조절해 보세요.")
+        rr_err = 100.0
 
-    # ==========================================
-    # [구역 3] 지표별 오차율 비교 (강건성 증명 기능)
-    # ==========================================
-    st.markdown("---")
-    st.header("🏆 [구역 3] 지표별 노이즈 영향 오차율 비교 (왜 R-R 간격이 최고인가?)")
-    st.markdown("노이즈 강도가 높아질 때, 형태학적 특징(Amplitude, Prominence)은 크게 무너지지만 **시간적 특징인 R-R 간격은 왜곡이 적어 강건함(Robustness)**을 유지함을 증명합니다.")
+    # 진폭 오차율 계산
+    if len(test_peaks) > 0:
+        current_amp = np.mean(test_filt[test_peaks])
+        amp_err = (abs(current_amp - base_amp) / base_amp) * 100
+    else:
+        amp_err = 100.0
 
-    features = ['R-R Interval\n(시간적 지표)', 'Peak Amplitude\n(형태학적 지표)', 'Peak Prominence\n(형태학적 지표)']
-    errors = [err_rr, err_amp, err_prom]
-    colors = ['#2ca02c', '#d62728', '#9467bd']
+    rr_errors.append(min(rr_err, 100.0))
+    amp_errors.append(min(amp_err, 100.0))
 
-    fig3, ax3 = plt.subplots(figsize=(10, 4.5), dpi=300)
-    bars = ax3.bar(features, errors, color=colors, width=0.4)
-    ax3.set_ylabel("Error Rate (%)", fontweight='bold')
-    ax3.set_ylim(0, max(max(errors) * 1.3, 10))
-    ax3.grid(axis='y', linestyle='--', alpha=0.5)
+# Plotly 스트레스 테스트 그래프 구축 (세로축 0부터 시작)
+fig3 = go.Figure()
+fig3.add_trace(
+    go.Scatter(
+        x=noise_range,
+        y=rr_errors,
+        mode="lines+markers",
+        name="시간적 지표 (R-R Interval Error %)",
+        line=dict(color="#1f77b4", width=3),
+    )
+)
+fig3.add_trace(
+    go.Scatter(
+        x=noise_range,
+        y=amp_errors,
+        mode="lines+markers",
+        name="형태학적 지표 (Peak Amplitude Error %)",
+        line=dict(color="#ff7f0e", width=3, dash="dash"),
+    )
+)
 
-    for bar in bars:
-        height = bar.get_height()
-        ax3.text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                 f'{height:.2f}%', ha='center', va='bottom', fontweight='bold')
+fig3.update_layout(
+    xaxis_title="노이즈 강도 (Noise Intensity)",
+    yaxis_title="오차율 (Error Rate %)",
+    yaxis=dict(range=[0, 105]),  # Y축 0부터 시작 설정
+    template="plotly_white",
+    hovermode="x unified",
+    height=400,
+)
 
-    plt.tight_layout()
-    st.pyplot(fig3)
+st.plotly_chart(fig3, use_container_width=True)
+
+# ------------------------------------------
+# 요약 메트릭 카드
+# ------------------------------------------
+col1, col2, col3 = st.columns(3)
+col1.metric("현재 R-R 간격 평균", f"{np.mean(rr_intervals_ms):.1f} ms")
+col2.metric(
+    "현재 시간적 지표 추정 오차율",
+    f"{rr_errors[int(noise_level*10)]:.2f} %",
+)
+col3.metric(
+    "현재 형태학적 지표 추정 오차율",
+    f"{amp_errors[int(noise_level*10)]:.2f} %",
+    delta_color="inverse",
+)
